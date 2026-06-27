@@ -26,8 +26,8 @@ func New(rdb *redis.Client) *Queue {
 func (q *Queue) EnsureGroup(ctx context.Context) error {
 	streams := []string{StreamCritical, StreamDefault, StreamLow}
 	for _, s := range streams {
-		// Using starting ID "$" to only read new messages (naive implementation)
-		err := q.rdb.XGroupCreateMkStream(ctx, s, ConsumerGroup, "$").Err()
+		// Using starting ID "0" forces Redis to read messages from the beginning of the stream.
+		err := q.rdb.XGroupCreateMkStream(ctx, s, ConsumerGroup, "0").Err()
 		if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
 			return err
 		}
