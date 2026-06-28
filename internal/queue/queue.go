@@ -101,6 +101,14 @@ func (q *Queue) Read(ctx context.Context, consumer string, block time.Duration) 
 	return nil, nil
 }
 
+var dueJobsScript = redis.NewScript(`
+	local jobs = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, 100)
+	if #jobs > 0 then
+		redis.call('ZREM', KEYS[1], unpack(jobs))
+	end
+	return jobs
+`)
+
 func (q *Queue) Schedule(ctx context.Context, jobID string, runAt time.Time) error {
 	return q.rdb.ZAdd(ctx, StreamScheduled, redis.Z{
 		Score:  float64(runAt.Unix()),
@@ -110,24 +118,9 @@ func (q *Queue) Schedule(ctx context.Context, jobID string, runAt time.Time) err
 
 func (q *Queue) DueJobs(ctx context.Context) ([]string, error) {
 	now := strconv.FormatInt(time.Now().Unix(), 10)
-	jobs, err := q.rdb.ZRangeByScore(ctx, StreamScheduled, &redis.ZRangeBy{
-		Min:    "-inf",
-		Max:    now,
-		Offset: 0,
-		Count:  100,
-	}).Result()
-	if err != nil {
+	res, err := dueJobsScript.Run(ctx, q.rdb, []string{StreamScheduled}, now).StringSlice()
+	if err != nil && err != redis.Nil {
 		return nil, err
 	}
-	if len(jobs) > 0 {
-		members := make([]any, len(jobs))
-		for i, v := range jobs {
-			members[i] = v
-		}
-		err = q.rdb.ZRem(ctx, StreamScheduled, members...).Err()
-		if err != nil {
-			return nil, err
-		}
-	}
-	return jobs, nil
+	return res, nil
 }
