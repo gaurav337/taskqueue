@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 const (
@@ -52,14 +54,23 @@ func (q *Queue) Publish(ctx context.Context, jobID, jobType, priority string, pa
 		stream = StreamLow
 	}
 
+	values := map[string]any{
+		"job_id":   jobID,
+		"type":     jobType,
+		"priority": priority,
+		"payload":  string(pBytes),
+	}
+
+	// Propagate W3C trace context
+	carrier := propagation.MapCarrier{}
+	otel.GetTextMapPropagator().Inject(ctx, carrier)
+	for k, v := range carrier {
+		values[k] = v
+	}
+
 	return q.rdb.XAdd(ctx, &redis.XAddArgs{
 		Stream: stream,
-		Values: map[string]any{
-			"job_id":   jobID,
-			"type":     jobType,
-			"priority": priority,
-			"payload":  string(pBytes),
-		},
+		Values: values,
 	}).Err()
 }
 

@@ -17,10 +17,14 @@ import (
 
 	"github.com/gaurav337/taskqueue/internal/job"
 	"github.com/gaurav337/taskqueue/internal/queue"
+	"github.com/gaurav337/taskqueue/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/propagation"
 )
 
 var (
@@ -51,6 +55,7 @@ var (
 			Help: "Total number of reclaimed stranded jobs",
 		},
 	)
+	tracer = otel.Tracer("taskqueue-worker")
 )
 
 func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
@@ -72,110 +77,135 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 			activeWorkers.Inc()
 			defer activeWorkers.Dec()
 			for msg := range jobs {
-				jobID, _ := msg.Values["job_id"].(string)
-				streamKey, _ := msg.Values["_stream"].(string)
+				func(msg redis.XMessage) {
+					jobID, _ := msg.Values["job_id"].(string)
+					streamKey, _ := msg.Values["_stream"].(string)
 
-				slog.Info("processing job", "worker_id", workerID, "job_id", jobID)
-
-				start := time.Now()
-
-				// 1. Fetch job metadata from store
-				j, err := store.Get(context.Background(), jobID)
-				if err != nil {
-					slog.Error("failed to retrieve job metadata", "job_id", jobID, "error", err)
-					q.Ack(context.Background(), streamKey, msg.ID)
-					continue
-				}
-
-				// Avoid double-processing already completed or failed jobs
-				if j.Status == job.StatusDone || j.Status == job.StatusFailed {
-					slog.Info("job already in terminal state, skipping processing and acking", "job_id", jobID, "status", j.Status)
-					if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
-						slog.Error("failed to ack terminal state job", "job_id", jobID, "error", err)
+					// Extract trace context propagated over Redis Stream headers
+					carrier := propagation.MapCarrier{}
+					for k, v := range msg.Values {
+						if strVal, ok := v.(string); ok {
+							carrier[k] = strVal
+						}
 					}
-					continue
-				}
+					extractedCtx := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
 
-				// 2. Increment attempt count
-				j.Attempts++
-				j.UpdatedAt = time.Now()
+					ctx, span := tracer.Start(extractedCtx, "process_job")
+					defer span.End()
 
-				// 3. Execute/Process job (simulate failure if job type is "fail" or payload contains "fail": true)
-				var processErr error
-				if j.Type == "fail" || (j.Payload != nil && j.Payload["fail"] == true) {
-					processErr = fmt.Errorf("simulated job failure")
-				}
+					slog.Info("processing job", "worker_id", workerID, "job_id", jobID)
+					span.SetAttributes(
+						attribute.String("job.id", jobID),
+						attribute.String("worker.id", strconv.Itoa(workerID)),
+					)
 
-				duration := time.Since(start).Seconds()
-				jobLatency.WithLabelValues(j.Type).Observe(duration)
+					start := time.Now()
 
-				if processErr == nil {
-					// Job succeeded!
-					j.Status = job.StatusDone
-					j.Error = ""
-					if err := store.Save(context.Background(), j); err != nil {
-						slog.Error("failed to update job success status", "job_id", jobID, "error", err)
+					// 1. Fetch job metadata from store
+					j, err := store.Get(ctx, jobID)
+					if err != nil {
+						slog.Error("failed to retrieve job metadata", "job_id", jobID, "error", err)
+						q.Ack(context.Background(), streamKey, msg.ID)
+						span.RecordError(err)
+						return
 					}
-					if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
-						slog.Error("failed to ack success", "msg_id", msg.ID, "error", err)
-					}
-					jobsProcessed.WithLabelValues(j.Type, "success").Inc()
-				} else {
-					// Job failed!
-					slog.Warn("job processing failed", "job_id", jobID, "attempt", j.Attempts, "max_attempts", j.MaxAttempts, "error", processErr)
-					j.Error = processErr.Error()
 
-					if j.Attempts < j.MaxAttempts {
-						// Retry: calculate exponential backoff with jitter
-						j.Status = job.StatusPending
+					span.SetAttributes(
+						attribute.String("job.type", j.Type),
+						attribute.Int("job.attempts", j.Attempts),
+					)
 
-						// Backoff calculation: base = 100ms, max = 5s
-						base := 100 * time.Millisecond
-						maxBackoff := 5 * time.Second
-						temp := float64(base) * math.Pow(2, float64(j.Attempts))
-						backoff := time.Duration(temp)
-						if backoff > maxBackoff {
-							backoff = maxBackoff
-						}
-						// Add up to 100ms jitter
-						jitterRange := int64(100 * time.Millisecond)
-						n, randErr := rand.Int(rand.Reader, big.NewInt(jitterRange))
-						if randErr == nil {
-							backoff += time.Duration(n.Int64())
-						}
-
-						j.RunAfter = &time.Time{}
-						*j.RunAfter = time.Now().Add(backoff)
-
-						if err := store.Save(context.Background(), j); err != nil {
-							slog.Error("failed to save retry metadata", "job_id", jobID, "error", err)
-						}
-
-						if err := q.Schedule(context.Background(), j.ID, *j.RunAfter); err != nil {
-							slog.Error("failed to reschedule job for retry", "job_id", jobID, "error", err)
-						}
-
+					// Avoid double-processing already completed or failed jobs
+					if j.Status == job.StatusDone || j.Status == job.StatusFailed {
+						slog.Info("job already in terminal state, skipping processing and acking", "job_id", jobID, "status", j.Status)
 						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
-							slog.Error("failed to ack retried job", "job_id", jobID, "error", err)
+							slog.Error("failed to ack terminal state job", "job_id", jobID, "error", err)
 						}
-						jobsProcessed.WithLabelValues(j.Type, "retry").Inc()
+						return
+					}
+
+					// 2. Increment attempt count
+					j.Attempts++
+					j.UpdatedAt = time.Now()
+
+					// 3. Execute/Process job (simulate failure if job type is "fail" or payload contains "fail": true)
+					var processErr error
+					if j.Type == "fail" || (j.Payload != nil && j.Payload["fail"] == true) {
+						processErr = fmt.Errorf("simulated job failure")
+					}
+
+					duration := time.Since(start).Seconds()
+					jobLatency.WithLabelValues(j.Type).Observe(duration)
+
+					if processErr == nil {
+						// Job succeeded!
+						j.Status = job.StatusDone
+						j.Error = ""
+						if err := store.Save(context.Background(), j); err != nil {
+							slog.Error("failed to update job success status", "job_id", jobID, "error", err)
+						}
+						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+							slog.Error("failed to ack success", "msg_id", msg.ID, "error", err)
+						}
+						jobsProcessed.WithLabelValues(j.Type, "success").Inc()
 					} else {
-						// Terminal Failure: Route to Dead Letter Queue (DLQ)
-						j.Status = job.StatusFailed
-						if err := store.Save(context.Background(), j); err != nil {
-							slog.Error("failed to save terminal job metadata", "job_id", jobID, "error", err)
-						}
+						// Job failed!
+						slog.Warn("job processing failed", "job_id", jobID, "attempt", j.Attempts, "max_attempts", j.MaxAttempts, "error", processErr)
+						j.Error = processErr.Error()
+						span.RecordError(processErr)
 
-						if err := q.PublishDLQ(context.Background(), j); err != nil {
-							slog.Error("failed to publish to DLQ", "job_id", jobID, "error", err)
-						}
+						if j.Attempts < j.MaxAttempts {
+							// Retry: calculate exponential backoff with jitter
+							j.Status = job.StatusPending
 
-						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
-							slog.Error("failed to ack terminal job", "job_id", jobID, "error", err)
+							// Backoff calculation: base = 100ms, max = 5s
+							base := 100 * time.Millisecond
+							maxBackoff := 5 * time.Second
+							temp := float64(base) * math.Pow(2, float64(j.Attempts))
+							backoff := time.Duration(temp)
+							if backoff > maxBackoff {
+								backoff = maxBackoff
+							}
+							// Add up to 100ms jitter
+							jitterRange := int64(100 * time.Millisecond)
+							n, randErr := rand.Int(rand.Reader, big.NewInt(jitterRange))
+							if randErr == nil {
+								backoff += time.Duration(n.Int64())
+							}
+
+							j.RunAfter = &time.Time{}
+							*j.RunAfter = time.Now().Add(backoff)
+
+							if err := store.Save(context.Background(), j); err != nil {
+								slog.Error("failed to save retry metadata", "job_id", jobID, "error", err)
+							}
+
+							if err := q.Schedule(context.Background(), j.ID, *j.RunAfter); err != nil {
+								slog.Error("failed to reschedule job for retry", "job_id", jobID, "error", err)
+							}
+
+							if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+								slog.Error("failed to ack retried job", "job_id", jobID, "error", err)
+							}
+							jobsProcessed.WithLabelValues(j.Type, "retry").Inc()
+						} else {
+							// Terminal Failure: Route to Dead Letter Queue (DLQ)
+							j.Status = job.StatusFailed
+							if err := store.Save(context.Background(), j); err != nil {
+								slog.Error("failed to save terminal job metadata", "job_id", jobID, "error", err)
+							}
+
+							if err := q.PublishDLQ(context.Background(), j); err != nil {
+								slog.Error("failed to publish to DLQ", "job_id", jobID, "error", err)
+							}
+
+							if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+								slog.Error("failed to ack terminal job", "job_id", jobID, "error", err)
+							}
+							jobsProcessed.WithLabelValues(j.Type, "failed").Inc()
 						}
-						jobsProcessed.WithLabelValues(j.Type, "failed").Inc()
 					}
-				}
+				}(msg)
 			}
 		}(i)
 	}
@@ -251,6 +281,17 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	otlpEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if otlpEndpoint == "" {
+		otlpEndpoint = "http://localhost:4318"
+	}
+	shutdownTracer, err := telemetry.InitTracer(context.Background(), "taskqueue-worker", otlpEndpoint)
+	if err != nil {
+		slog.Error("failed to initialize tracer", "error", err)
+	} else {
+		defer shutdownTracer()
+	}
 
 	// Start background Prometheus metrics server on :9090
 	go func() {

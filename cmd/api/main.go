@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -11,10 +12,13 @@ import (
 
 	"github.com/gaurav337/taskqueue/internal/job"
 	"github.com/gaurav337/taskqueue/internal/queue"
+	"github.com/gaurav337/taskqueue/internal/telemetry"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 )
 
 var (
@@ -25,6 +29,7 @@ var (
 		},
 		[]string{"type", "priority"},
 	)
+	tracer = otel.Tracer("taskqueue-api")
 )
 
 func uuidv4() (string, error) {
@@ -51,6 +56,9 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("POST /jobs", func(w http.ResponseWriter, r *http.Request) {
+		ctx, span := tracer.Start(r.Context(), "SubmitJob")
+		defer span.End()
+
 		var req JobReq
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
@@ -70,6 +78,12 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 			return
 		}
 
+		span.SetAttributes(
+			attribute.String("job.id", id),
+			attribute.String("job.type", req.Type),
+			attribute.String("job.priority", req.Priority),
+		)
+
 		now := time.Now()
 		j := &job.Job{
 			ID:          id,
@@ -87,18 +101,18 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 			j.RunAfter = req.RunAfter
 		}
 
-		if err := store.Save(r.Context(), j); err != nil {
+		if err := store.Save(ctx, j); err != nil {
 			http.Error(w, "failed to save job", http.StatusInternalServerError)
 			return
 		}
 
 		if j.RunAfter != nil {
-			if err := q.Schedule(r.Context(), j.ID, *j.RunAfter); err != nil {
+			if err := q.Schedule(ctx, j.ID, *j.RunAfter); err != nil {
 				http.Error(w, "failed to schedule job", http.StatusInternalServerError)
 				return
 			}
 		} else {
-			if err := q.Publish(r.Context(), j.ID, j.Type, j.Priority, j.Payload); err != nil {
+			if err := q.Publish(ctx, j.ID, j.Type, j.Priority, j.Payload); err != nil {
 				http.Error(w, "failed to publish job", http.StatusInternalServerError)
 				return
 			}
@@ -116,7 +130,11 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 
 	mux.HandleFunc("GET /jobs/{id}/status", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
-		j, err := store.Get(r.Context(), id)
+		ctx, span := tracer.Start(r.Context(), "GetJobStatus")
+		defer span.End()
+		span.SetAttributes(attribute.String("job.id", id))
+
+		j, err := store.Get(ctx, id)
 		if err != nil {
 			if err == redis.Nil {
 				http.Error(w, "job not found", http.StatusNotFound)
@@ -138,6 +156,17 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
+
+	otlpEndpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if otlpEndpoint == "" {
+		otlpEndpoint = "http://localhost:4318"
+	}
+	shutdownTracer, err := telemetry.InitTracer(context.Background(), "taskqueue-api", otlpEndpoint)
+	if err != nil {
+		slog.Error("failed to initialize tracer", "error", err)
+	} else {
+		defer shutdownTracer()
+	}
 
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	mux := setupRouter(rdb)
