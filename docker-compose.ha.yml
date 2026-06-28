@@ -1,0 +1,130 @@
+services:
+  redis-master:
+    image: redis:7-alpine
+    container_name: redis-master
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  redis-replica:
+    image: redis:7-alpine
+    container_name: redis-replica
+    command: redis-server --replicaof redis-master 6379
+    expose:
+      - "6379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+
+  sentinel-1:
+    image: redis:7-alpine
+    container_name: sentinel-1
+    command:
+      - sh
+      - -c
+      - |
+        until ping -c 1 redis-master >/dev/null 2>&1; do
+          echo 'waiting for redis-master resolution'
+          sleep 1
+        done
+        MASTER_IP=$$(ping -c 1 redis-master | head -n 1 | awk -F'[()]' '{print $$2}')
+        echo "resolved master IP: $${MASTER_IP}"
+        echo 'port 26379' > /tmp/sentinel.conf
+        echo "sentinel monitor mymaster $${MASTER_IP} 6379 2" >> /tmp/sentinel.conf
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf
+        echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf
+        echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf
+        redis-server /tmp/sentinel.conf --sentinel
+    expose:
+      - "26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_started
+
+  sentinel-2:
+    image: redis:7-alpine
+    container_name: sentinel-2
+    command:
+      - sh
+      - -c
+      - |
+        until ping -c 1 redis-master >/dev/null 2>&1; do
+          echo 'waiting for redis-master resolution'
+          sleep 1
+        done
+        MASTER_IP=$$(ping -c 1 redis-master | head -n 1 | awk -F'[()]' '{print $$2}')
+        echo "resolved master IP: $${MASTER_IP}"
+        echo 'port 26379' > /tmp/sentinel.conf
+        echo "sentinel monitor mymaster $${MASTER_IP} 6379 2" >> /tmp/sentinel.conf
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf
+        echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf
+        echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf
+        redis-server /tmp/sentinel.conf --sentinel
+    expose:
+      - "26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_started
+
+  sentinel-3:
+    image: redis:7-alpine
+    container_name: sentinel-3
+    command:
+      - sh
+      - -c
+      - |
+        until ping -c 1 redis-master >/dev/null 2>&1; do
+          echo 'waiting for redis-master resolution'
+          sleep 1
+        done
+        MASTER_IP=$$(ping -c 1 redis-master | head -n 1 | awk -F'[()]' '{print $$2}')
+        echo "resolved master IP: $${MASTER_IP}"
+        echo 'port 26379' > /tmp/sentinel.conf
+        echo "sentinel monitor mymaster $${MASTER_IP} 6379 2" >> /tmp/sentinel.conf
+        echo 'sentinel down-after-milliseconds mymaster 5000' >> /tmp/sentinel.conf
+        echo 'sentinel failover-timeout mymaster 10000' >> /tmp/sentinel.conf
+        echo 'sentinel parallel-syncs mymaster 1' >> /tmp/sentinel.conf
+        redis-server /tmp/sentinel.conf --sentinel
+    expose:
+      - "26379"
+    depends_on:
+      redis-master:
+        condition: service_healthy
+      redis-replica:
+        condition: service_started
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_SENTINEL_ADDRS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - REDIS_MASTER_NAME=mymaster
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    depends_on:
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    environment:
+      - REDIS_SENTINEL_ADDRS=sentinel-1:26379,sentinel-2:26379,sentinel-3:26379
+      - REDIS_MASTER_NAME=mymaster
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318
+    depends_on:
+      - sentinel-1
+      - sentinel-2
+      - sentinel-3

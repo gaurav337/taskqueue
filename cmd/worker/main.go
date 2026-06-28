@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -278,7 +279,24 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	sentinels := os.Getenv("REDIS_SENTINEL_ADDRS")
+	masterName := os.Getenv("REDIS_MASTER_NAME")
+	var rdb *redis.Client
+	if sentinels != "" && masterName != "" {
+		sAddrs := strings.Split(sentinels, ",")
+		rdb = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    masterName,
+			SentinelAddrs: sAddrs,
+		})
+		slog.Info("connected to Redis Sentinel cluster", "master", masterName, "sentinels", sAddrs)
+	} else {
+		addr := os.Getenv("REDIS_ADDR")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		rdb = redis.NewClient(&redis.Options{Addr: addr})
+		slog.Info("connected to standalone Redis instance", "addr", addr)
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
