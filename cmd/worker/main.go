@@ -51,15 +51,16 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 	}
 
 	go func() {
+	loop:
 		for {
 			select {
 			case <-ctx.Done():
-				break
+				break loop
 			default:
 				msgs, err := q.Read(ctx, consumerName, 2*time.Second)
 				if err != nil {
 					if ctx.Err() != nil {
-						break
+						break loop
 					}
 					continue
 				}
@@ -67,7 +68,7 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 					select {
 					case jobs <- msg:
 					case <-ctx.Done():
-						break
+						break loop
 					}
 				}
 			}
