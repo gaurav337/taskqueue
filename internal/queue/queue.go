@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 
@@ -10,10 +11,11 @@ import (
 )
 
 const (
-	StreamCritical = "task_queue:critical"
-	StreamDefault  = "task_queue:default"
-	StreamLow      = "task_queue:low"
-	ConsumerGroup  = "workers"
+	StreamCritical  = "task_queue:critical"
+	StreamDefault   = "task_queue:default"
+	StreamLow       = "task_queue:low"
+	StreamScheduled = "task_queue:scheduled"
+	ConsumerGroup   = "workers"
 )
 
 type Queue struct {
@@ -97,4 +99,35 @@ func (q *Queue) Read(ctx context.Context, consumer string, block time.Duration) 
 		}
 	}
 	return nil, nil
+}
+
+func (q *Queue) Schedule(ctx context.Context, jobID string, runAt time.Time) error {
+	return q.rdb.ZAdd(ctx, StreamScheduled, redis.Z{
+		Score:  float64(runAt.Unix()),
+		Member: jobID,
+	}).Err()
+}
+
+func (q *Queue) DueJobs(ctx context.Context) ([]string, error) {
+	now := strconv.FormatInt(time.Now().Unix(), 10)
+	jobs, err := q.rdb.ZRangeByScore(ctx, StreamScheduled, &redis.ZRangeBy{
+		Min:    "-inf",
+		Max:    now,
+		Offset: 0,
+		Count:  100,
+	}).Result()
+	if err != nil {
+		return nil, err
+	}
+	if len(jobs) > 0 {
+		members := make([]any, len(jobs))
+		for i, v := range jobs {
+			members[i] = v
+		}
+		err = q.rdb.ZRem(ctx, StreamScheduled, members...).Err()
+		if err != nil {
+			return nil, err
+		}
+	}
+	return jobs, nil
 }

@@ -28,6 +28,7 @@ type JobReq struct {
 	Type     string         `json:"type"`
 	Priority string         `json:"priority"`
 	Payload  map[string]any `json:"payload"`
+	RunAfter *time.Time     `json:"run_after,omitempty"`
 }
 
 func setupRouter(rdb *redis.Client) *http.ServeMux {
@@ -69,14 +70,25 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 			UpdatedAt:   now,
 		}
 
+		if req.RunAfter != nil && req.RunAfter.After(now) {
+			j.RunAfter = req.RunAfter
+		}
+
 		if err := store.Save(r.Context(), j); err != nil {
 			http.Error(w, "failed to save job", http.StatusInternalServerError)
 			return
 		}
 
-		if err := q.Publish(r.Context(), j.ID, j.Type, j.Priority, j.Payload); err != nil {
-			http.Error(w, "failed to publish job", http.StatusInternalServerError)
-			return
+		if j.RunAfter != nil {
+			if err := q.Schedule(r.Context(), j.ID, *j.RunAfter); err != nil {
+				http.Error(w, "failed to schedule job", http.StatusInternalServerError)
+				return
+			}
+		} else {
+			if err := q.Publish(r.Context(), j.ID, j.Type, j.Priority, j.Payload); err != nil {
+				http.Error(w, "failed to publish job", http.StatusInternalServerError)
+				return
+			}
 		}
 
 		w.Header().Set("Content-Type", "application/json")
