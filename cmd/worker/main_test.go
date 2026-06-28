@@ -240,3 +240,129 @@ func TestWorkerDLQ(t *testing.T) {
 		t.Errorf("expected DLQ job status 'failed', got %s", dlqJob.Status)
 	}
 }
+
+func TestWorkerCrashRecovery(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer rdb.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Configure a short reclaim idle time for fast testing
+	originalReclaimAfter := queue.ReclaimAfter
+	queue.ReclaimAfter = 50 * time.Millisecond
+	defer func() { queue.ReclaimAfter = originalReclaimAfter }()
+
+	t.Cleanup(func() {
+		rdb.Del(context.Background(), queue.StreamCritical, queue.StreamDefault, queue.StreamLow)
+	})
+
+	q := queue.New(rdb)
+	store := job.NewStore(rdb)
+
+	if err := q.EnsureGroup(ctx); err != nil {
+		t.Fatalf("failed to ensure group: %v", err)
+	}
+
+	// Case 1: Job was processing, worker crashed (status is still pending in DB)
+	jobID1 := "recovery-test-job-1"
+	j1 := &job.Job{
+		ID:          jobID1,
+		Type:        "email",
+		Priority:    "default",
+		Payload:     map[string]any{"to": "user1@example.com"},
+		Status:      job.StatusPending,
+		MaxAttempts: 3,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := store.Save(ctx, j1); err != nil {
+		t.Fatalf("failed to save job1: %v", err)
+	}
+	defer rdb.Del(context.Background(), "job:"+jobID1)
+
+	if err := q.Publish(ctx, j1.ID, j1.Type, j1.Priority, j1.Payload); err != nil {
+		t.Fatalf("failed to publish job1: %v", err)
+	}
+
+	// Move message to PEL of "crashed-worker" by reading it
+	_, err := rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    queue.ConsumerGroup,
+		Consumer: "crashed-worker",
+		Streams:  []string{queue.StreamDefault, ">"},
+		Count:    1,
+		Block:    -1,
+	}).Result()
+	if err != nil {
+		t.Fatalf("failed to read message to PEL: %v", err)
+	}
+
+	// Case 2: Job completed but worker crashed before ACK (status is done in DB, message still in PEL)
+	jobID2 := "recovery-test-job-2"
+	j2 := &job.Job{
+		ID:          jobID2,
+		Type:        "email",
+		Priority:    "default",
+		Payload:     map[string]any{"to": "user2@example.com"},
+		Status:      job.StatusDone,
+		Attempts:    1,
+		MaxAttempts: 3,
+		CreatedAt:   time.Now(),
+		UpdatedAt:   time.Now(),
+	}
+	if err := store.Save(ctx, j2); err != nil {
+		t.Fatalf("failed to save job2: %v", err)
+	}
+	defer rdb.Del(context.Background(), "job:"+jobID2)
+
+	if err := q.Publish(ctx, j2.ID, j2.Type, j2.Priority, j2.Payload); err != nil {
+		t.Fatalf("failed to publish job2: %v", err)
+	}
+
+	// Move job2 message to PEL of "crashed-worker" by reading it
+	_, err = rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    queue.ConsumerGroup,
+		Consumer: "crashed-worker",
+		Streams:  []string{queue.StreamDefault, ">"},
+		Count:    1,
+		Block:    -1,
+	}).Result()
+	if err != nil {
+		t.Fatalf("failed to read message2 to PEL: %v", err)
+	}
+
+	// Start a worker to recover and process these messages
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- Run(ctx, rdb, 1)
+	}()
+
+	// Wait for the reclaimer to scan PEL (every 5 seconds) and process
+	time.Sleep(7 * time.Second)
+	cancel()
+	<-errChan
+
+	// Verify Case 1: Job was recovered and completed
+	dbJob1, err := store.Get(context.Background(), jobID1)
+	if err != nil {
+		t.Fatalf("failed to get job1: %v", err)
+	}
+	if dbJob1.Status != job.StatusDone {
+		t.Errorf("expected job1 to be Done, got status: %s", dbJob1.Status)
+	}
+	if dbJob1.Attempts != 1 {
+		t.Errorf("expected job1 attempts to be 1, got: %d", dbJob1.Attempts)
+	}
+
+	// Verify Case 2: Check if double-processing happened
+	dbJob2, err := store.Get(context.Background(), jobID2)
+	if err != nil {
+		t.Fatalf("failed to get job2: %v", err)
+	}
+	if dbJob2.Attempts != 1 {
+		t.Errorf("FRICTION: expected job2 attempts to remain 1 since it was already done, but it was incremented to %d", dbJob2.Attempts)
+	}
+}
+
