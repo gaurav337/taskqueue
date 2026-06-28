@@ -11,7 +11,20 @@ import (
 
 	"github.com/gaurav337/taskqueue/internal/job"
 	"github.com/gaurav337/taskqueue/internal/queue"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+)
+
+var (
+	jobsSubmitted = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "taskqueue_jobs_submitted_total",
+			Help: "Total number of jobs submitted via the API",
+		},
+		[]string{"type", "priority"},
+	)
 )
 
 func uuidv4() (string, error) {
@@ -91,6 +104,8 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 			}
 		}
 
+		jobsSubmitted.WithLabelValues(j.Type, j.Priority).Inc()
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
 		json.NewEncoder(w).Encode(map[string]any{
@@ -114,6 +129,8 @@ func setupRouter(rdb *redis.Client) *http.ServeMux {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(j)
 	})
+
+	mux.Handle("GET /metrics", promhttp.Handler())
 
 	return mux
 }

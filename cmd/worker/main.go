@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"math"
 	"math/big"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -16,7 +17,40 @@ import (
 
 	"github.com/gaurav337/taskqueue/internal/job"
 	"github.com/gaurav337/taskqueue/internal/queue"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
+)
+
+var (
+	jobsProcessed = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "taskqueue_jobs_processed_total",
+			Help: "Total number of processed jobs",
+		},
+		[]string{"type", "status"},
+	)
+	jobLatency = promauto.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "taskqueue_job_latency_seconds",
+			Help:    "Execution latency of jobs",
+			Buckets: prometheus.DefBuckets,
+		},
+		[]string{"type"},
+	)
+	activeWorkers = promauto.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "taskqueue_active_workers",
+			Help: "Current number of active worker goroutines",
+		},
+	)
+	reclaimedJobs = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "taskqueue_reclaimed_jobs_total",
+			Help: "Total number of reclaimed stranded jobs",
+		},
+	)
 )
 
 func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
@@ -35,11 +69,15 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 		wg.Add(1)
 		go func(workerID int) {
 			defer wg.Done()
+			activeWorkers.Inc()
+			defer activeWorkers.Dec()
 			for msg := range jobs {
 				jobID, _ := msg.Values["job_id"].(string)
 				streamKey, _ := msg.Values["_stream"].(string)
 
 				slog.Info("processing job", "worker_id", workerID, "job_id", jobID)
+
+				start := time.Now()
 
 				// 1. Fetch job metadata from store
 				j, err := store.Get(context.Background(), jobID)
@@ -68,6 +106,9 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 					processErr = fmt.Errorf("simulated job failure")
 				}
 
+				duration := time.Since(start).Seconds()
+				jobLatency.WithLabelValues(j.Type).Observe(duration)
+
 				if processErr == nil {
 					// Job succeeded!
 					j.Status = job.StatusDone
@@ -78,6 +119,7 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 					if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
 						slog.Error("failed to ack success", "msg_id", msg.ID, "error", err)
 					}
+					jobsProcessed.WithLabelValues(j.Type, "success").Inc()
 				} else {
 					// Job failed!
 					slog.Warn("job processing failed", "job_id", jobID, "attempt", j.Attempts, "max_attempts", j.MaxAttempts, "error", processErr)
@@ -116,6 +158,7 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
 							slog.Error("failed to ack retried job", "job_id", jobID, "error", err)
 						}
+						jobsProcessed.WithLabelValues(j.Type, "retry").Inc()
 					} else {
 						// Terminal Failure: Route to Dead Letter Queue (DLQ)
 						j.Status = job.StatusFailed
@@ -130,6 +173,7 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
 							slog.Error("failed to ack terminal job", "job_id", jobID, "error", err)
 						}
+						jobsProcessed.WithLabelValues(j.Type, "failed").Inc()
 					}
 				}
 			}
@@ -155,6 +199,7 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 				}
 				for _, msg := range msgs {
 					slog.Info("reclaimer claimed orphaned task", "msg_id", msg.ID, "stream", msg.Values["_stream"])
+					reclaimedJobs.Inc()
 					select {
 					case jobs <- msg:
 					case <-ctx.Done():
@@ -164,6 +209,7 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 			}
 		}
 	}()
+
 
 	go func() {
 	loop:
@@ -205,6 +251,16 @@ func main() {
 	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+
+	// Start background Prometheus metrics server on :9090
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.Handler())
+		slog.Info("starting worker metrics server on :9090")
+		if err := http.ListenAndServe(":9090", mux); err != nil {
+			slog.Error("worker metrics server failed", "error", err)
+		}
+	}()
 
 	if err := Run(ctx, rdb, 3); err != nil {
 		slog.Error("worker error", "error", err)
