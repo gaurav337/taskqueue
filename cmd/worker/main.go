@@ -49,6 +49,15 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 					continue
 				}
 
+				// Avoid double-processing already completed or failed jobs
+				if j.Status == job.StatusDone || j.Status == job.StatusFailed {
+					slog.Info("job already in terminal state, skipping processing and acking", "job_id", jobID, "status", j.Status)
+					if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+						slog.Error("failed to ack terminal state job", "job_id", jobID, "error", err)
+					}
+					continue
+				}
+
 				// 2. Increment attempt count
 				j.Attempts++
 				j.UpdatedAt = time.Now()
@@ -126,6 +135,35 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 			}
 		}(i)
 	}
+
+	// Start background reclaimer to monitor and claim orphaned PEL jobs
+	go func() {
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				msgs, err := q.Reclaim(ctx, consumerName)
+				if err != nil {
+					if ctx.Err() != nil {
+						return
+					}
+					slog.Error("failed to reclaim tasks", "error", err)
+					continue
+				}
+				for _, msg := range msgs {
+					slog.Info("reclaimer claimed orphaned task", "msg_id", msg.ID, "stream", msg.Values["_stream"])
+					select {
+					case jobs <- msg:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
+		}
+	}()
 
 	go func() {
 	loop:

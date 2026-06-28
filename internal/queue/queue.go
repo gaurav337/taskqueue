@@ -136,3 +136,29 @@ func (q *Queue) PublishDLQ(ctx context.Context, j interface{}) error {
 		Values: map[string]any{"data": string(data)},
 	}).Err()
 }
+
+var ReclaimAfter = 30 * time.Second
+
+func (q *Queue) Reclaim(ctx context.Context, consumer string) ([]redis.XMessage, error) {
+	var allMsgs []redis.XMessage
+	streams := []string{StreamCritical, StreamDefault, StreamLow}
+	for _, s := range streams {
+		msgs, _, err := q.rdb.XAutoClaim(ctx, &redis.XAutoClaimArgs{
+			Stream:   s,
+			Group:    ConsumerGroup,
+			Consumer: consumer,
+			MinIdle:  ReclaimAfter,
+			Start:    "0-0",
+			Count:    10,
+		}).Result()
+		if err != nil && err != redis.Nil {
+			return nil, err
+		}
+		for i := range msgs {
+			msgs[i].Values["_stream"] = s
+		}
+		allMsgs = append(allMsgs, msgs...)
+	}
+	return allMsgs, nil
+}
+
