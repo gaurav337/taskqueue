@@ -3,6 +3,7 @@ package queue_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 	"github.com/gaurav337/taskqueue/internal/queue"
@@ -150,4 +151,71 @@ func TestQueue_ColdBootBacklogBug(t *testing.T) {
 			t.Errorf("expected job_id 'historical-2', got %v", streams[0].Messages[0].Values["job_id"])
 		}
 	})
+}
+
+func TestQueue_ReadPriority(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer rdb.Close()
+
+	ctx := context.Background()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatalf("failed to connect to redis: %v", err)
+	}
+
+	cleanUp := func() {
+		rdb.Del(ctx, queue.StreamCritical, queue.StreamDefault, queue.StreamLow)
+	}
+	cleanUp()
+	defer cleanUp()
+
+	q := queue.New(rdb)
+	if err := q.EnsureGroup(ctx); err != nil {
+		t.Fatalf("failed to ensure group: %v", err)
+	}
+
+	// 1. Publish a low priority job
+	err := q.Publish(ctx, "low-job", "test", "low", map[string]any{"key": "low"})
+	if err != nil {
+		t.Fatalf("failed to publish low: %v", err)
+	}
+
+	// 2. Publish a critical priority job
+	err = q.Publish(ctx, "crit-job", "test", "critical", map[string]any{"key": "crit"})
+	if err != nil {
+		t.Fatalf("failed to publish critical: %v", err)
+	}
+
+	// 3. Read from queue. Since "critical" is checked first, it should return the critical job!
+	msgs, err := q.Read(ctx, "worker-1", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to read: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+
+	if msgs[0].Values["job_id"] != "crit-job" {
+		t.Errorf("expected critical job first, got %v", msgs[0].Values["job_id"])
+	}
+
+	// 4. Ack the critical job
+	err = q.Ack(ctx, queue.StreamCritical, msgs[0].ID)
+	if err != nil {
+		t.Fatalf("failed to ack: %v", err)
+	}
+
+	// 5. Read again. Now it should return the low priority job!
+	msgs, err = q.Read(ctx, "worker-1", 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("failed to read second time: %v", err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+
+	if msgs[0].Values["job_id"] != "low-job" {
+		t.Errorf("expected low priority job next, got %v", msgs[0].Values["job_id"])
+	}
 }
