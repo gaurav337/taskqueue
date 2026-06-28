@@ -72,6 +72,12 @@ Telemetry features provide observability into the task queue runtime:
 - **Prometheus Metrics**: The API server (port `:8080/metrics`) and Worker daemon (port `:9090/metrics`) expose metrics including job submission counts, processing throughput (success/retry/failed), execution latency histograms, active worker counts, and task reclaim rates.
 - **OpenTelemetry Tracing**: Trace spans track the job lifecycle across boundaries. W3C Trace Context headers are propagated transparently inside Redis Stream message headers. Spans are exported via HTTP to an OTLP-compatible collector (e.g., Jaeger) at `http://localhost:4318`. Exporter shutdowns utilize a 200ms timeout context to ensure non-blocking application teardowns when the collector is offline.
 
+### High Availability (HA) & Failover
+The system is fully containerized utilizing multi-stage distroless images for production readiness. A High Availability (HA) Redis Sentinel orchestration overlay is provided (`docker-compose.ha.yml`), configuring 3 Sentinels, 1 Master, and 1 Replica. Go applications utilize `redis.NewFailoverClient` to automatically track topology changes and seamlessly reconnect upon master failure elections.
+
+### CI/CD Pipeline
+Continuous Integration is fully automated via GitHub Actions. On every push and pull request to the `main` branch, the pipeline executes `go vet`, runs the full integration test suite against an ephemeral Redis 7 container service, and verifies `Dockerfile` distroless multi-stage build compilations for both the API and Worker services.
+
 ---
 
 ## Getting Started
@@ -81,9 +87,14 @@ Telemetry features provide observability into the task queue runtime:
 - Docker and Docker Compose (to run Redis)
 
 ### Running Infrastructure (Redis)
-Start the Redis instance in detached mode:
+Start the standalone Redis instance in detached mode:
 ```bash
 docker compose up -d
+```
+
+For the High Availability Sentinel cluster:
+```bash
+docker compose -f docker-compose.ha.yml up --build -d
 ```
 
 ### Running the API Server
@@ -152,7 +163,13 @@ go test -p 1 -v ./...
 │   └── telemetry/
 │       ├── tracer.go     # OpenTelemetry HTTP exporter setup
 │       └── tracer_test.go # Tracer provider initialization & shutdown timeout tests
-├── docker-compose.yml     # Local Redis environment definition
+├── .github/
+│   └── workflows/
+│       └── ci.yml         # GitHub Actions CI/CD pipeline configuration
+├── Dockerfile.api         # Multi-stage distroless API container build
+├── Dockerfile.worker      # Multi-stage distroless Worker container build
+├── docker-compose.yml     # Local standalone Redis environment definition
+├── docker-compose.ha.yml  # High-Availability Redis Sentinel cluster environment definition
 ├── engineering_journal.md # Recorded engineering incidents & fixes
 ├── go.mod                 # Go module file
 ├── go.sum                 # Go sum dependencies file
