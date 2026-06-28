@@ -2,7 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"fmt"
 	"log/slog"
+	"math"
+	"math/big"
 	"os"
 	"os/signal"
 	"strconv"
@@ -36,15 +40,88 @@ func Run(ctx context.Context, rdb *redis.Client, poolSize int) error {
 				streamKey, _ := msg.Values["_stream"].(string)
 
 				slog.Info("processing job", "worker_id", workerID, "job_id", jobID)
-				time.Sleep(50 * time.Millisecond)
 
-				err := store.UpdateStatus(context.Background(), jobID, job.StatusDone, "")
+				// 1. Fetch job metadata from store
+				j, err := store.Get(context.Background(), jobID)
 				if err != nil {
-					slog.Error("failed to update status", "job_id", jobID, "error", err)
+					slog.Error("failed to retrieve job metadata", "job_id", jobID, "error", err)
+					q.Ack(context.Background(), streamKey, msg.ID)
+					continue
 				}
-				err = q.Ack(context.Background(), streamKey, msg.ID)
-				if err != nil {
-					slog.Error("failed to ack", "job_id", jobID, "error", err)
+
+				// 2. Increment attempt count
+				j.Attempts++
+				j.UpdatedAt = time.Now()
+
+				// 3. Execute/Process job (simulate failure if job type is "fail" or payload contains "fail": true)
+				var processErr error
+				if j.Type == "fail" || (j.Payload != nil && j.Payload["fail"] == true) {
+					processErr = fmt.Errorf("simulated job failure")
+				}
+
+				if processErr == nil {
+					// Job succeeded!
+					j.Status = job.StatusDone
+					j.Error = ""
+					if err := store.Save(context.Background(), j); err != nil {
+						slog.Error("failed to update job success status", "job_id", jobID, "error", err)
+					}
+					if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+						slog.Error("failed to ack success", "msg_id", msg.ID, "error", err)
+					}
+				} else {
+					// Job failed!
+					slog.Warn("job processing failed", "job_id", jobID, "attempt", j.Attempts, "max_attempts", j.MaxAttempts, "error", processErr)
+					j.Error = processErr.Error()
+
+					if j.Attempts < j.MaxAttempts {
+						// Retry: calculate exponential backoff with jitter
+						j.Status = job.StatusPending
+
+						// Backoff calculation: base = 100ms, max = 5s
+						base := 100 * time.Millisecond
+						maxBackoff := 5 * time.Second
+						temp := float64(base) * math.Pow(2, float64(j.Attempts))
+						backoff := time.Duration(temp)
+						if backoff > maxBackoff {
+							backoff = maxBackoff
+						}
+						// Add up to 100ms jitter
+						jitterRange := int64(100 * time.Millisecond)
+						n, randErr := rand.Int(rand.Reader, big.NewInt(jitterRange))
+						if randErr == nil {
+							backoff += time.Duration(n.Int64())
+						}
+
+						j.RunAfter = &time.Time{}
+						*j.RunAfter = time.Now().Add(backoff)
+
+						if err := store.Save(context.Background(), j); err != nil {
+							slog.Error("failed to save retry metadata", "job_id", jobID, "error", err)
+						}
+
+						if err := q.Schedule(context.Background(), j.ID, *j.RunAfter); err != nil {
+							slog.Error("failed to reschedule job for retry", "job_id", jobID, "error", err)
+						}
+
+						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+							slog.Error("failed to ack retried job", "job_id", jobID, "error", err)
+						}
+					} else {
+						// Terminal Failure: Route to Dead Letter Queue (DLQ)
+						j.Status = job.StatusFailed
+						if err := store.Save(context.Background(), j); err != nil {
+							slog.Error("failed to save terminal job metadata", "job_id", jobID, "error", err)
+						}
+
+						if err := q.PublishDLQ(context.Background(), j); err != nil {
+							slog.Error("failed to publish to DLQ", "job_id", jobID, "error", err)
+						}
+
+						if err := q.Ack(context.Background(), streamKey, msg.ID); err != nil {
+							slog.Error("failed to ack terminal job", "job_id", jobID, "error", err)
+						}
+					}
 				}
 			}
 		}(i)
