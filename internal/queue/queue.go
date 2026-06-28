@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -61,4 +62,35 @@ func (q *Queue) Publish(ctx context.Context, jobID, jobType, priority string, pa
 
 func (q *Queue) Ack(ctx context.Context, streamKey, msgID string) error {
 	return q.rdb.XAck(ctx, streamKey, ConsumerGroup, msgID).Err()
+}
+
+func (q *Queue) Read(ctx context.Context, consumer string, block time.Duration) ([]redis.XMessage, error) {
+	streams := []string{StreamCritical, StreamDefault, StreamLow}
+	for i, s := range streams {
+		b := block
+
+		res, err := q.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+			Group:    ConsumerGroup,
+			Consumer: consumer,
+			Streams:  []string{s, ">"},
+			Count:    10,
+			Block:    b,
+		}).Result()
+
+		if err != nil {
+			if err == redis.Nil {
+				continue
+			}
+			return nil, err
+		}
+
+		if len(res) > 0 && len(res[0].Messages) > 0 {
+			msgs := res[0].Messages
+			for j := range msgs {
+				msgs[j].Values["_stream"] = s
+			}
+			return msgs, nil
+		}
+	}
+	return nil, nil
 }
