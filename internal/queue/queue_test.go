@@ -2,6 +2,8 @@ package queue_test
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -217,5 +219,128 @@ func TestQueue_ReadPriority(t *testing.T) {
 
 	if msgs[0].Values["job_id"] != "low-job" {
 		t.Errorf("expected low priority job next, got %v", msgs[0].Values["job_id"])
+	}
+}
+
+func TestQueue_Schedule(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer rdb.Close()
+
+	ctx := context.Background()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatalf("failed to connect to redis: %v", err)
+	}
+
+	// Clean up
+	rdb.Del(ctx, queue.StreamScheduled)
+	defer rdb.Del(ctx, queue.StreamScheduled)
+
+	q := queue.New(rdb)
+
+	now := time.Now()
+	// Schedule 1 job in the past (due now) and 1 in the future (not due yet)
+	err := q.Schedule(ctx, "job-due-1", now.Add(-5*time.Second))
+	if err != nil {
+		t.Fatalf("failed to schedule: %v", err)
+	}
+
+	err = q.Schedule(ctx, "job-future-1", now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("failed to schedule future: %v", err)
+	}
+
+	// Retrieve due jobs
+	due, err := q.DueJobs(ctx)
+	if err != nil {
+		t.Fatalf("failed to fetch due: %v", err)
+	}
+
+	if len(due) != 1 {
+		t.Fatalf("expected exactly 1 due job, got %d: %v", len(due), due)
+	}
+
+	if due[0] != "job-due-1" {
+		t.Errorf("expected due job 'job-due-1', got %s", due[0])
+	}
+}
+
+func TestQueue_DueJobsConcurrency(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr: "localhost:6379",
+	})
+	defer rdb.Close()
+
+	ctx := context.Background()
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		t.Fatalf("failed to connect to redis: %v", err)
+	}
+
+	rdb.Del(ctx, queue.StreamScheduled)
+	defer rdb.Del(ctx, queue.StreamScheduled)
+
+	q := queue.New(rdb)
+
+	// Schedule a batch of 50 due jobs
+	numJobs := 50
+	for i := 1; i <= numJobs; i++ {
+		jobID := fmt.Sprintf("concur-job-%d", i)
+		err := q.Schedule(ctx, jobID, time.Now().Add(-10*time.Second))
+		if err != nil {
+			t.Fatalf("failed to schedule job %d: %v", i, err)
+		}
+	}
+
+	// Run multiple concurrent scheduler workers popping from the sorted set
+	numWorkers := 5
+	poppedChan := make(chan string, numJobs*2)
+	errChan := make(chan error, numWorkers)
+
+	var wg sync.WaitGroup
+	for w := 1; w <= numWorkers; w++ {
+		wg.Add(1)
+		go func(workerID int) {
+			defer wg.Done()
+			for {
+				due, err := q.DueJobs(ctx)
+				if err != nil {
+					errChan <- err
+					return
+				}
+				if len(due) == 0 {
+					// No more due jobs
+					break
+				}
+				for _, id := range due {
+					poppedChan <- id
+				}
+				time.Sleep(10 * time.Millisecond) // Yield/jitter
+			}
+		}(w)
+	}
+
+	wg.Wait()
+	close(poppedChan)
+	close(errChan)
+
+	for err := range errChan {
+		t.Fatalf("worker error: %v", err)
+	}
+
+	// Verify that each job was popped EXACTLY once
+	seen := make(map[string]int)
+	for id := range poppedChan {
+		seen[id]++
+	}
+
+	if len(seen) != numJobs {
+		t.Errorf("expected to pop all %d jobs, but only got %d unique jobs", numJobs, len(seen))
+	}
+
+	for id, count := range seen {
+		if count > 1 {
+			t.Errorf("job %s was popped %d times! (Double pop / TOCTOU race detected)", id, count)
+		}
 	}
 }
