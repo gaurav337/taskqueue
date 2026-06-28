@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gaurav337/taskqueue/internal/job"
@@ -168,7 +169,24 @@ func main() {
 		defer shutdownTracer()
 	}
 
-	rdb := redis.NewClient(&redis.Options{Addr: "localhost:6379"})
+	sentinels := os.Getenv("REDIS_SENTINEL_ADDRS")
+	masterName := os.Getenv("REDIS_MASTER_NAME")
+	var rdb *redis.Client
+	if sentinels != "" && masterName != "" {
+		sAddrs := strings.Split(sentinels, ",")
+		rdb = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    masterName,
+			SentinelAddrs: sAddrs,
+		})
+		slog.Info("connected to Redis Sentinel cluster", "master", masterName, "sentinels", sAddrs)
+	} else {
+		addr := os.Getenv("REDIS_ADDR")
+		if addr == "" {
+			addr = "localhost:6379"
+		}
+		rdb = redis.NewClient(&redis.Options{Addr: addr})
+		slog.Info("connected to standalone Redis instance", "addr", addr)
+	}
 	mux := setupRouter(rdb)
 
 	slog.Info("starting API server on :8080")
