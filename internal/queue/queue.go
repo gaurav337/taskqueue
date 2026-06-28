@@ -15,6 +15,7 @@ const (
 	StreamDefault   = "task_queue:default"
 	StreamLow       = "task_queue:low"
 	StreamScheduled = "task_queue:scheduled"
+	StreamDLQ       = "task_queue:dlq"
 	ConsumerGroup   = "workers"
 )
 
@@ -123,4 +124,15 @@ func (q *Queue) DueJobs(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	return res, nil
+}
+
+func (q *Queue) PublishDLQ(ctx context.Context, j interface{}) error {
+	data, err := json.Marshal(j)
+	if err != nil {
+		return err
+	}
+	return q.rdb.XAdd(ctx, &redis.XAddArgs{
+		Stream: StreamDLQ,
+		Values: map[string]any{"data": string(data)},
+	}).Err()
 }
