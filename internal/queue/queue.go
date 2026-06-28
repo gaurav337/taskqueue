@@ -67,7 +67,11 @@ func (q *Queue) Ack(ctx context.Context, streamKey, msgID string) error {
 func (q *Queue) Read(ctx context.Context, consumer string, block time.Duration) ([]redis.XMessage, error) {
 	streams := []string{StreamCritical, StreamDefault, StreamLow}
 	for i, s := range streams {
-		b := block
+		// Use -1 to omit the BLOCK parameter, executing a fast, non-blocking check on empty streams
+		b := time.Duration(-1)
+		if i == 2 {
+			b = block
+		}
 
 		res, err := q.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
 			Group:    ConsumerGroup,
