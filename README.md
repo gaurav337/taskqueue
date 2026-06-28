@@ -121,9 +121,9 @@ All benchmarks were executed on a local development machine with Redis running i
 
 ### 🖥️ Benchmark Execution Proof
 ````carousel
-![TaskScheduler Benchmark Harness CLI Run - Part 1](./assets/mode%20all%20-jobs%201000%20-workers%2010_part%201.png)
+![TaskScheduler Benchmark Harness CLI Run - Part 1](./assets/mode_all_jobs_1000_workers_10_part_1.png)
 <!-- slide -->
-![TaskScheduler Benchmark Harness CLI Run - Part 2](./assets/mode%20all%20-jobs%201000%20-workers%2010_part%202.png)
+![TaskScheduler Benchmark Harness CLI Run - Part 2](./assets/mode_all_jobs_1000_workers_10_part_2.png)
 ````
 
 ---
@@ -340,9 +340,9 @@ go test -p 1 -race -v ./...
 
 ### 🧪 Integration Test Execution Proof
 ````carousel
-![Integration Test Suite Race-Enabled Run - Part 1](./assets/go%20test%20-p%201%20-race%201.png)
+![Integration Test Suite Race-Enabled Run - Part 1](./assets/go_test_race_1.png)
 <!-- slide -->
-![Integration Test Suite Race-Enabled Run - Part 2](./assets/go%20test%20-p%201%20-race%20%202.png)
+![Integration Test Suite Race-Enabled Run - Part 2](./assets/go_test_race_2.png)
 ````
 
 **Latest test results (v1.0.0):**
